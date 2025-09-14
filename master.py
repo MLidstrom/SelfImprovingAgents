@@ -1,4 +1,5 @@
 import os
+import json
 import re
 import shutil
 import subprocess
@@ -24,20 +25,19 @@ master_prompt = PromptTemplate(
     1. Read the servant's current source code provided below.
     2. Check the servant's output against its input.
     3. If the output is wrong or could be better, rewrite the servant's entire code to improve it, keeping input from standard input.
-    4. If the output is spot-on, say no changes are needed.
-    5. Save your new code or decision for the next step.
+    4. If the output is spot-on, indicate that no changes are needed.
+    5. Respond with a JSON object containing your reasoning and the new code (if any).
 
     The servant got this input: "{servant_input}"
     It gave this output: "{servant_output}"
     Its current code will follow separately.
 
-    Give your reasoning and, if needed, new code. Use this format:
-    Reasoning: [Your reasoning here]
-    New Code:
-    ```python
-    [New servant.py code here]
-    ```
-    or "No improvement needed".
+    Respond with a JSON object in the following format:
+    {{
+        "reasoning": "Your reasoning here",
+        "new_code": "```python\\n[New servant.py code here]\\n```"
+    }}
+    If no improvement is needed, `new_code` should be "No improvement needed".
     """
 )
 
@@ -80,39 +80,74 @@ def run_master_agent(servant_input, servant_output, servant_code):
     return master_response.content
 
 def main():
-    # Use a location-related query instead of a math problem
-    test_input = "Where are we in the world?"
-    print("Running Servant (Initial Run)...")
-    initial_output = run_servant(test_input)
-    print(f"Servant Output: {initial_output}\n")
+    test_cases = [
+        {"input": "What is 2 + 2?", "expected_output": "4"},
+        {"input": "what is 10 divided by 2?", "expected_output": "5.0"},
+        {"input": "what time is it?", "validation": "The current time is"},
+        {"input": "where are we?", "validation": "Based on your IP, you appear to be in"},
+        {"input": "what is my ip address?", "validation": "Your public IP address is:"}
+    ]
 
-    servant_code = read_servant_code()
-    print("Running Master Agent...")
-    master_response = run_master_agent(test_input, initial_output, servant_code)
-    print(f"Master Response:\n{master_response}\n")
+    for i, test_case in enumerate(test_cases):
+        print(f"--- Running Test Case #{i+1} ---")
+        test_input = test_case["input"]
+        print(f"Input: {test_input}")
 
-    if "New Code:" in master_response:
-        reasoning, new_code_section = master_response.split("New Code:", 1)
-        new_code = new_code_section.strip()
+        servant_output = run_servant(test_input)
+        print(f"Servant Output: {servant_output}")
 
-        if new_code != "No improvement needed":
-            # Attempt to extract only the Python code fenced by ```python ... ```
-            code_pattern = r"```python\s*(.*?)\s*```"
-            match = re.search(code_pattern, new_code, re.DOTALL)
+        # Validate output
+        output_is_correct = False
+        if "expected_output" in test_case:
+            if servant_output == test_case["expected_output"]:
+                output_is_correct = True
+        elif "validation" in test_case:
+            if test_case["validation"] in servant_output:
+                output_is_correct = True
 
-            if match:
-                pure_python_code = match.group(1).strip()
-                print("Updating Servant Code with code between ```python and ```...")
-                write_servant_code(pure_python_code)
-                print("Running Servant (Improved Run)...")
-                improved_output = run_servant(test_input)
-                print(f"Improved Servant Output: {improved_output}")
+        if output_is_correct:
+            print("Output is correct. No improvement needed.\n")
+            continue
+
+        print("Output is incorrect or needs improvement.")
+        servant_code = read_servant_code()
+        print("Running Master Agent...")
+        master_response = run_master_agent(test_input, servant_output, servant_code)
+        print(f"Master Response:\n{master_response}\n")
+
+        try:
+            # Extract the JSON part of the response
+            json_match = re.search(r'\{.*\}', master_response, re.DOTALL)
+            if not json_match:
+                print("No JSON object found in the master response.")
+                continue
+
+            response_json = json.loads(json_match.group(0))
+            reasoning = response_json.get("reasoning", "")
+            new_code = response_json.get("new_code", "")
+
+            print(f"Master Reasoning: {reasoning}")
+
+            if new_code and new_code != "No improvement needed":
+                # Attempt to extract only the Python code fenced by ```python ... ```
+                code_pattern = r"```python\s*(.*?)\s*```"
+                match = re.search(code_pattern, new_code, re.DOTALL)
+
+                if match:
+                    pure_python_code = match.group(1).strip()
+                    print("Updating Servant Code...")
+                    write_servant_code(pure_python_code)
+                    print("Running Servant (Improved Run)...")
+                    improved_output = run_servant(test_input)
+                    print(f"Improved Servant Output: {improved_output}\n")
+                else:
+                    print("No valid Python code block found in the master response. No update performed.\n")
             else:
-                print("No valid Python code block found in the master response. No update performed.")
-        else:
-            print("No improvement needed per Master Agent.")
-    else:
-        print("Master agent response format invalid.")
+                print("No improvement needed per Master Agent.\n")
+        except json.JSONDecodeError:
+            print("Master agent response is not valid JSON.\n")
+        except Exception as e:
+            print(f"An error occurred: {e}\n")
 
 if __name__ == "__main__":
     main()
