@@ -4,7 +4,7 @@ import requests
 from datetime import datetime
 import socket
 import re
-
+from asteval import Interpreter
 class ServantAgent:
     def __init__(self):
         self.capabilities = {
@@ -54,7 +54,8 @@ class ServantAgent:
         """Evaluates a mathematical expression safely."""
         try:
             # Evaluate the expression and return the result
-            return str(eval(expression))
+            aeval = Interpreter()
+            return str(aeval.eval(expression))
         except Exception as e:
             return f"Error: {str(e)}"
 
