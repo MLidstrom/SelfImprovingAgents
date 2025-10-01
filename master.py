@@ -3,6 +3,9 @@ import json
 import re
 import shutil
 import subprocess
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Optional, Dict, Any, List
 
 from dotenv import load_dotenv
 from langchain.prompts import PromptTemplate
@@ -12,8 +15,28 @@ from langchain_openai import ChatOpenAI
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Set up the LLM for the master
-llm = ChatOpenAI(model="gpt-4o", temperature=0.5, api_key=OPENAI_API_KEY)
+
+class MissingAPIKeyError(RuntimeError):
+    """Raised when the OpenAI API key is not available."""
+
+
+@lru_cache(maxsize=1)
+def get_llm() -> ChatOpenAI:
+    """Return a cached ChatOpenAI client.
+
+    The original implementation eagerly instantiated the client at import time
+    which made the module fail fast even when the master agent was not used.
+    By lazily constructing the client we provide clearer error messaging and
+    avoid unnecessary API calls during unit tests.
+    """
+
+    if not OPENAI_API_KEY:
+        raise MissingAPIKeyError(
+            "OPENAI_API_KEY is not set. Please create a .env file with the key "
+            "or export it before running the master agent."
+        )
+
+    return ChatOpenAI(model="gpt-4o", temperature=0.5, api_key=OPENAI_API_KEY)
 
 # Master agent prompt
 master_prompt = PromptTemplate(
@@ -57,97 +80,151 @@ def write_servant_code(new_code, file_path="servant.py"):
         f.write(new_code)
 
 # Run the servant with input via standard input
-def run_servant(input_query):
+def run_servant(input_query: str) -> str:
+    """Execute the servant script and capture its output.
+
+    A non-zero exit code previously went unnoticed. Capturing stderr and
+    surfacing it makes debugging easier when the servant crashes.
+    """
+
     result = subprocess.run(
         ["python", "servant.py"],
         input=input_query,
         capture_output=True,
-        text=True
+        text=True,
+        check=False,
     )
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        raise RuntimeError(
+            "Servant execution failed with exit code "
+            f"{result.returncode}: {stderr or 'No error output captured.'}"
+        )
+
     return result.stdout.strip()
 
 # Run the master agent
-def run_master_agent(servant_input, servant_output, servant_code):
+def run_master_agent(servant_input: str, servant_output: str, servant_code: str) -> str:
     master_input = {
         "servant_input": servant_input,
         "servant_output": servant_output,
         "servant_code": servant_code
     }
-    master_response = llm.invoke(
+    master_response = get_llm().invoke(
         master_prompt.format(**master_input)
         + f"\nServant Source Code:\n```\n{servant_code}\n```"
     )
     return master_response.content
 
-def main():
-    test_cases = [
-        {"input": "What is 2 + 2?", "expected_output": "4"},
-        {"input": "what is 10 divided by 2?", "expected_output": "5.0"},
-        {"input": "what time is it?", "validation": "The current time is"},
-        {"input": "where are we?", "validation": "Based on your IP, you appear to be in"},
-        {"input": "what is my ip address?", "validation": "Your public IP address is:"}
+
+def extract_json_block(response: str) -> Optional[Dict[str, Any]]:
+    """Extract the first valid JSON object from an LLM response."""
+
+    decoder = json.JSONDecoder()
+    stripped_response = response.strip()
+
+    for index, char in enumerate(stripped_response):
+        if char != "{":
+            continue
+
+        try:
+            obj, _ = decoder.raw_decode(stripped_response[index:])
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            continue
+
+    return None
+
+
+@dataclass
+class TestCase:
+    input: str
+    expected_output: Optional[str] = None
+    validation: Optional[str] = None
+
+    def validate(self, servant_output: str) -> bool:
+        if self.expected_output is not None:
+            return servant_output == self.expected_output
+
+        if self.validation is not None:
+            return self.validation in servant_output
+
+        raise ValueError("Test case must define either expected_output or validation.")
+
+def main() -> None:
+    test_cases: List[TestCase] = [
+        TestCase(input="What is 2 + 2?", expected_output="4"),
+        TestCase(input="what is 10 divided by 2?", expected_output="5.0"),
+        TestCase(input="what time is it?", validation="The current time is"),
+        TestCase(input="where are we?", validation="Based on your IP, you appear to be in"),
+        TestCase(input="what is my ip address?", validation="Your public IP address is:"),
     ]
 
-    for i, test_case in enumerate(test_cases):
-        print(f"--- Running Test Case #{i+1} ---")
-        test_input = test_case["input"]
-        print(f"Input: {test_input}")
+    for index, test_case in enumerate(test_cases, start=1):
+        print(f"--- Running Test Case #{index} ---")
+        print(f"Input: {test_case.input}")
 
-        servant_output = run_servant(test_input)
+        try:
+            servant_output = run_servant(test_case.input)
+        except RuntimeError as exc:
+            print(f"Servant failed to run: {exc}\n")
+            continue
+
         print(f"Servant Output: {servant_output}")
 
-        # Validate output
-        output_is_correct = False
-        if "expected_output" in test_case:
-            if servant_output == test_case["expected_output"]:
-                output_is_correct = True
-        elif "validation" in test_case:
-            if test_case["validation"] in servant_output:
-                output_is_correct = True
-
-        if output_is_correct:
-            print("Output is correct. No improvement needed.\n")
+        try:
+            if test_case.validate(servant_output):
+                print("Output is correct. No improvement needed.\n")
+                continue
+        except ValueError as exc:
+            print(f"Invalid test case configuration: {exc}\n")
             continue
 
         print("Output is incorrect or needs improvement.")
         servant_code = read_servant_code()
         print("Running Master Agent...")
-        master_response = run_master_agent(test_input, servant_output, servant_code)
-        print(f"Master Response:\n{master_response}\n")
 
         try:
-            # Extract the JSON part of the response
-            json_match = re.search(r'\{.*\}', master_response, re.DOTALL)
-            if not json_match:
-                print("No JSON object found in the master response.")
-                continue
+            master_response = run_master_agent(test_case.input, servant_output, servant_code)
+        except MissingAPIKeyError as exc:
+            print(f"Cannot contact master agent: {exc}\n")
+            break
 
-            response_json = json.loads(json_match.group(0))
-            reasoning = response_json.get("reasoning", "")
-            new_code = response_json.get("new_code", "")
+        print(f"Master Response:\n{master_response}\n")
 
-            print(f"Master Reasoning: {reasoning}")
+        response_json = extract_json_block(master_response)
+        if not response_json:
+            print("No JSON object found in the master response.\n")
+            continue
 
-            if new_code and new_code != "No improvement needed":
-                # Attempt to extract only the Python code fenced by ```python ... ```
-                code_pattern = r"```python\s*(.*?)\s*```"
-                match = re.search(code_pattern, new_code, re.DOTALL)
+        reasoning = response_json.get("reasoning", "")
+        new_code = response_json.get("new_code", "")
+        print(f"Master Reasoning: {reasoning}")
 
-                if match:
-                    pure_python_code = match.group(1).strip()
-                    print("Updating Servant Code...")
-                    write_servant_code(pure_python_code)
-                    print("Running Servant (Improved Run)...")
-                    improved_output = run_servant(test_input)
-                    print(f"Improved Servant Output: {improved_output}\n")
-                else:
-                    print("No valid Python code block found in the master response. No update performed.\n")
-            else:
-                print("No improvement needed per Master Agent.\n")
-        except json.JSONDecodeError:
-            print("Master agent response is not valid JSON.\n")
-        except Exception as e:
-            print(f"An error occurred: {e}\n")
+        if not new_code or new_code == "No improvement needed":
+            print("No improvement needed per Master Agent.\n")
+            continue
+
+        code_pattern = r"```python\s*(.*?)\s*```"
+        match = re.search(code_pattern, new_code, re.DOTALL)
+        if not match:
+            print("No valid Python code block found in the master response. No update performed.\n")
+            continue
+
+        pure_python_code = match.group(1).strip()
+        print("Updating Servant Code...")
+        write_servant_code(pure_python_code)
+        print("Running Servant (Improved Run)...")
+
+        try:
+            improved_output = run_servant(test_case.input)
+        except RuntimeError as exc:
+            print(f"Improved servant failed to run: {exc}\n")
+            continue
+
+        print(f"Improved Servant Output: {improved_output}\n")
 
 if __name__ == "__main__":
     main()
